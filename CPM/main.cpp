@@ -223,7 +223,7 @@ int main(int argc, char** argv)
             // Guardar resultados sin sección crítica porque cada hilo tiene su propio archivo
             archivosSalida[tid] << nombre1 << "," << nombre2 << "," << (std::isnan(f) ? 0.0 : f) << "," << duracion << "\n";
 
-            // Si quieres info en consola, puedes dejar este bloque con critical para evitar mezclas
+            
             #pragma omp critical
             {
                 std::cout << "Hilo " << tid << " comparó: " << nombre1 << " vs " << nombre2
