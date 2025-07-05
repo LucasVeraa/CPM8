@@ -1,4 +1,3 @@
-
 #include "CPM.h"
 #include "OpticFlowIO.h"
 
@@ -25,6 +24,7 @@
 #include <chrono>
 
 #include <omp.h>
+
 
 using namespace std;
 
@@ -96,6 +96,8 @@ int main(int argc, char** argv)
     std::string archivoSalidaBase = argv[2];
 
     std::vector<fs::path> imagenesPaths;
+
+    // Buscar imágenes en la carpeta
     for (const auto& entrada : fs::directory_iterator(carpeta)) {
         if (entrada.is_regular_file()) {
             std::string ext = entrada.path().extension().string();
@@ -111,19 +113,20 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    // Leer todas las imágenes solo una vez
+    // Leer imágenes una vez
     std::vector<FImage> imagenes(imagenesPaths.size());
     for (size_t i = 0; i < imagenesPaths.size(); ++i) {
         imagenes[i].imread(imagenesPaths[i].string().c_str());
     }
 
-    int numThreads = 8;
+    // Número de hilos
+    const int numThreads = 8;
     omp_set_num_threads(numThreads);
 
-    // Archivos de salida por hilo
+    // Crear archivos de salida separados por hilo
     std::vector<std::ofstream> archivosSalida(numThreads);
     for (int t = 0; t < numThreads; ++t) {
-        std::string nombreArchivo = archivoSalidaBase + "_thread_" + std::to_string(t) + ".csv";
+        std::string nombreArchivo = archivoSalidaBase + "thread" + std::to_string(t) + ".csv";
         archivosSalida[t].open(nombreArchivo);
         if (!archivosSalida[t].is_open()) {
             std::cerr << "No se pudo abrir el archivo de salida: " << nombreArchivo << "\n";
@@ -132,24 +135,20 @@ int main(int argc, char** argv)
         archivosSalida[t] << "imagen1,imagen2,resultado,tiempo_ms\n";
     }
 
-    size_t totalComparaciones = imagenes.size() * imagenes.size();
+    std::cout << "Usando " << numThreads << " hilos.\n";
 
-    // Buffer por hilo para acumular resultados antes de escribir
-    const size_t bufferSize = 1000;  // Ajustable según memoria y rendimiento
-    std::vector<std::vector<std::string>> buffers(numThreads);
+    size_t numImagenes = imagenes.size();
 
-    auto startTotal = std::chrono::high_resolution_clock::now();
-
-    // Variable atómica para mostrar progreso
-    std::atomic<size_t> comparacionesHechas(0);
-
+    // Paralelizar el doble for: comparar todos con todos (incluyendo i == j)
+    size_t totalComparaciones = 0;
+    auto tiempo_inicio = std::chrono::high_resolution_clock::now();
     #pragma omp parallel for collapse(2) schedule(dynamic,1)
-    for (int i = 0; i < (int)imagenes.size(); ++i) {
-        for (int j = 0; j < (int)imagenes.size(); ++j) {
+    for (size_t i = 0; i < numImagenes; ++i) {
+        for (size_t j = 0; j < numImagenes; ++j) {
             int tid = omp_get_thread_num();
             auto start = std::chrono::high_resolution_clock::now();
 
-            // Evitar imágenes con diferente tamaño
+            // Verificar dimensiones
             if (imagenes[i].width() != imagenes[j].width() || imagenes[i].height() != imagenes[j].height()) {
                 #pragma omp critical
                 std::cerr << "Imágenes con diferentes dimensiones: "
@@ -187,6 +186,9 @@ int main(int argc, char** argv)
 
             double f = 0.0;
             if (conta1 == 0 || conta2 == 0) {
+                #pragma omp critical
+                std::cerr << "Flujo desconocido en todas las posiciones entre "
+                          << imagenesPaths[i] << " y " << imagenesPaths[j] << "\n";
                 f = 0.0;
             } else {
                 int shift = static_cast<int>(std::abs(menor));
@@ -218,49 +220,29 @@ int main(int argc, char** argv)
             auto end = std::chrono::high_resolution_clock::now();
             double duracion = std::chrono::duration<double, std::milli>(end - start).count();
 
-            // Construir línea CSV
-            char linea[256];
-            snprintf(linea, sizeof(linea), "%s,%s,%.10f,%.3f\n", nombre1.c_str(), nombre2.c_str(), std::isnan(f) ? 0.0 : f, duracion);
+            // Guardar resultados sin sección crítica porque cada hilo tiene su propio archivo
+            archivosSalida[tid] << nombre1 << "," << nombre2 << "," << (std::isnan(f) ? 0.0 : f) << "," << duracion << "\n";
 
-            buffers[tid].emplace_back(linea);
-
-            // Si el buffer está lleno, vaciar a archivo
-            if (buffers[tid].size() >= bufferSize) {
-                std::ofstream& out = archivosSalida[tid];
-                for (const auto& l : buffers[tid]) {
-                    out << l;
-                }
-                buffers[tid].clear();
+            // Si quieres info en consola, puedes dejar este bloque con critical para evitar mezclas
+            #pragma omp critical
+            {
+                std::cout << "Hilo " << tid << " comparó: " << nombre1 << " vs " << nombre2
+                          << " = " << f << " en " << duracion << " ms\n";
             }
-
-            // Actualizar progreso y mostrar cada 100,000 comparaciones
-            size_t compActual = ++comparacionesHechas;
-            if (compActual % 1000 == 0) {
-		 auto ahora = std::chrono::high_resolution_clock::now();
-                 std::chrono::duration<double> tiempo_transcurrido = ahora - startTotal;
-                #pragma omp critical
-                {
-                    std::cout << "Progreso: " << compActual << " / " << totalComparaciones << " comparaciones realizadas.  | Tiempo transcurrido: " << tiempo_transcurrido.count() << " segundos\n";
-                }
-            }
+	    #pragma omp atomic
+            totalComparaciones++;
         }
     }
 
-    // Vaciar buffers restantes a archivo
+    // Cerrar archivos
     for (int t = 0; t < numThreads; ++t) {
-        std::ofstream& out = archivosSalida[t];
-        for (const auto& l : buffers[t]) {
-            out << l;
-        }
-        buffers[t].clear();
         archivosSalida[t].close();
     }
+    auto tiempo_fin = std::chrono::high_resolution_clock::now();
 
-    auto endTotal = std::chrono::high_resolution_clock::now();
-    double duracionTotal = std::chrono::duration<double>(endTotal - startTotal).count();
-
-    std::cout << "Comparaciones completadas: " << totalComparaciones << "\n";
-    std::cout << "Tiempo total de ejecución: " << duracionTotal << " segundos.\n";
-
+    double duracion_ms = std::chrono::duration<double, std::milli>(tiempo_fin - tiempo_inicio).count();
+    std::cout << "Comparaciones completadas.\n";
+    std::cout << "Total de comparaciones realizadas: " << totalComparaciones << std::endl;
+    std::cout << "Tiempo total de ejecución: " << duracion_ms << " ms" << std::endl;
     return 0;
 }
